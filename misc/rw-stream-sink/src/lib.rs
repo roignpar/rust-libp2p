@@ -51,7 +51,6 @@ where
     S::Item: IntoBuf,
 {
     /// Wraps around `inner`.
-    #[inline]
     pub fn new(inner: S) -> RwStreamSink<S> {
         RwStreamSink { inner, current_item: None }
     }
@@ -63,61 +62,26 @@ where
     S::Item: IntoBuf,
 {
     fn read(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        let mut written = 0;
-
-        loop {
-            let need_new_item = if let Some(ref i) = self.current_item {
-                !i.has_remaining()
-            } else {
-                true
-            };
-
-            if need_new_item {
-                loop {
-                    self.current_item = match self.inner.poll() {
-                        Ok(Async::Ready(None)) => None,
-                        Ok(Async::Ready(Some(i))) => {
-                            let b = i.into_buf();
-                            if !b.has_remaining() {
-                                continue // skip over empty items
-                            }
-                            Some(b)
-                        }
-                        Ok(Async::NotReady) => {
-                            if written == 0 {
-                                return Err(IoError::new(IoErrorKind::WouldBlock, "stream not ready"));
-                            } else {
-                                return Ok(written);
-                            }
-                        }
-                        Err(err) => {
-                            if written == 0 {
-                                return Err(err);
-                            } else {
-                                return Ok(written);
-                            }
-                        }
-                    };
-                    break
+        // Grab the item to copy from.
+        let item_to_copy = loop {
+            if let Some(ref mut i) = self.current_item {
+                if i.has_remaining() {
+                    break i;
                 }
             }
 
-            let current_item = match self.current_item {
-                Some(ref mut i) => i,
-                None => return Ok(written),
-            };
+            self.current_item = Some(match self.inner.poll()? {
+                Async::Ready(Some(i)) => i.into_buf(),
+                Async::Ready(None) => return Ok(0),     // EOF
+                Async::NotReady => return Err(IoErrorKind::WouldBlock.into()),
+            });
+        };
 
-            let to_copy = cmp::min(buf.len() - written, current_item.remaining());
-            if to_copy == 0 {
-                return Ok(written);
-            }
-
-            current_item
-                .by_ref()
-                .take(to_copy)
-                .copy_to_slice(&mut buf[written..(written + to_copy)]);
-            written += to_copy;
-        }
+        // Copy it!
+        debug_assert!(item_to_copy.has_remaining());
+        let to_copy = cmp::min(buf.len(), item_to_copy.remaining());
+        item_to_copy.take(to_copy).copy_to_slice(&mut buf[..to_copy]);
+        Ok(to_copy)
     }
 }
 
@@ -126,6 +90,9 @@ where
     S: Stream<Error = IoError>,
     S::Item: IntoBuf,
 {
+    unsafe fn prepare_uninitialized_buffer(&self, _: &mut [u8]) -> bool {
+        false
+    }
 }
 
 impl<S> Write for RwStreamSink<S>
@@ -134,7 +101,6 @@ where
     S::SinkItem: for<'r> From<&'r [u8]>,
     S::Item: IntoBuf,
 {
-    #[inline]
     fn write(&mut self, buf: &[u8]) -> Result<usize, IoError> {
         let len = buf.len();
         match self.inner.start_send(buf.into())? {
@@ -143,7 +109,6 @@ where
         }
     }
 
-    #[inline]
     fn flush(&mut self) -> Result<(), IoError> {
         match self.inner.poll_complete()? {
             Async::Ready(()) => Ok(()),
@@ -158,7 +123,6 @@ where
     S::SinkItem: for<'r> From<&'r [u8]>,
     S::Item: IntoBuf,
 {
-    #[inline]
     fn shutdown(&mut self) -> Poll<(), IoError> {
         self.inner.close()
     }
@@ -216,13 +180,9 @@ mod tests {
             .wait()
             .unwrap();
 
-        let mut data1 = [0u8; 5];
-        assert_eq!(wrapper.read(&mut data1).unwrap(), 5);
-        assert_eq!(&data1, b"hello");
-
-        let mut data2 = Vec::new();
-        wrapper.read_to_end(&mut data2).unwrap();
-        assert_eq!(data2, b" world");
+        let mut data = Vec::new();
+        wrapper.read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"hello world");
     }
 
     #[test]
@@ -230,7 +190,30 @@ mod tests {
         let data: Vec<&[u8]> = vec![b"", b"foo", b"", b"bar", b"", b"baz", b""];
         let mut rws = RwStreamSink::new(stream::iter_ok::<_, std::io::Error>(data));
         let mut buf = [0; 9];
-        assert_eq!(9, rws.read(&mut buf).unwrap());
-        assert_eq!(b"foobarbaz", &buf[..])
+        assert_eq!(3, rws.read(&mut buf).unwrap());
+        assert_eq!(3, rws.read(&mut buf[3..]).unwrap());
+        assert_eq!(3, rws.read(&mut buf[6..]).unwrap());
+        assert_eq!(0, rws.read(&mut buf).unwrap());
+        assert_eq!(b"foobarbaz", &buf[..]);
+    }
+
+    #[test]
+    fn partial_read() {
+        let data: Vec<&[u8]> = vec![b"hell", b"o world"];
+        let mut rws = RwStreamSink::new(stream::iter_ok::<_, std::io::Error>(data));
+        let mut buf = [0; 3];
+        assert_eq!(3, rws.read(&mut buf).unwrap());
+        assert_eq!(b"hel", &buf[..3]);
+        assert_eq!(0, rws.read(&mut buf[..0]).unwrap());
+        assert_eq!(1, rws.read(&mut buf).unwrap());
+        assert_eq!(b"l", &buf[..1]);
+        assert_eq!(3, rws.read(&mut buf).unwrap());
+        assert_eq!(b"o w", &buf[..3]);
+        assert_eq!(0, rws.read(&mut buf[..0]).unwrap());
+        assert_eq!(3, rws.read(&mut buf).unwrap());
+        assert_eq!(b"orl", &buf[..3]);
+        assert_eq!(1, rws.read(&mut buf).unwrap());
+        assert_eq!(b"d", &buf[..1]);
+        assert_eq!(0, rws.read(&mut buf).unwrap());
     }
 }

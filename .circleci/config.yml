@@ -44,21 +44,26 @@ jobs:
 
   test-wasm:
     docker:
-      - image: tomaka/rustc-emscripten
+      - image: parity/rust-builder:latest
     steps:
       - checkout
       - restore_cache:
-          key: test-wasm-cache
+          keys: 
+            - test-wasm-cache-{{ epoch }}
+            - test-wasm-cache
       - run:
           name: Build for wasm32
           # TODO: also run tests but with --no-run; important to detect linking errors
-          # TODO: secp doesn't compile for wasm yet
-          command: cargo web build --no-default-features --features "libp2p-websocket"
+          command: |
+            sccache -s
+            cargo web build
+            sccache -s
       - save_cache:
-          key: test-wasm-cache
+          key: test-wasm-cache-{{ epoch }}
           paths:
-            - "~/.cargo"
-            - "./target"
+            - ./target
+            - /usr/local/cargo
+            - /root/.cache/sccache
 
   test-win32:
     docker:

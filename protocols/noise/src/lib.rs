@@ -20,8 +20,12 @@
 
 //! [Noise protocol framework][noise] support for libp2p.
 //!
+//! > **Note**: This crate is still experimental and subject to major breaking changes
+//! >           both on the API and the wire protocol.
+//!
 //! This crate provides `libp2p_core::InboundUpgrade` and `libp2p_core::OutboundUpgrade`
-//! implementations for various noise handshake patterns, currently IK, IX, and XX.
+//! implementations for various noise handshake patterns (currently `IK`, `IX`, and `XX`)
+//! over a particular choice of DH key agreement (currently only X25519).
 //!
 //! All upgrades produce as output a pair, consisting of the remote's static public key
 //! and a `NoiseOutput` which represents the established cryptographic session with the
@@ -32,13 +36,15 @@
 //! Example:
 //!
 //! ```
-//! use libp2p_core::Transport;
+//! use libp2p_core::{identity, Transport};
 //! use libp2p_tcp::TcpConfig;
-//! use libp2p_noise::{Keypair, NoiseConfig};
+//! use libp2p_noise::{Keypair, X25519, NoiseConfig};
 //!
 //! # fn main() {
-//! let keypair = Keypair::gen_curve25519();
-//! let transport = TcpConfig::new().with_upgrade(NoiseConfig::xx(keypair));
+//! let id_keys = identity::Keypair::generate_ed25519();
+//! let dh_keys = Keypair::<X25519>::new().into_authentic(&id_keys).unwrap();
+//! let noise = NoiseConfig::xx(dh_keys);
+//! let transport = TcpConfig::new().with_upgrade(noise);
 //! // ...
 //! # }
 //! ```
@@ -47,97 +53,92 @@
 
 mod error;
 mod io;
-mod keys;
-mod util;
-
-pub mod rt1;
-pub mod rt15;
+mod protocol;
 
 pub use error::NoiseError;
 pub use io::NoiseOutput;
-pub use keys::{Curve25519, PublicKey, SecretKey, Keypair};
+pub use io::handshake::{Handshake, RemoteIdentity, IdentityExchange};
+pub use protocol::{Keypair, AuthenticKeypair, KeypairIdentity, PublicKey, SecretKey};
+pub use protocol::{Protocol, ProtocolParams, x25519::X25519, IX, IK, XX};
 
-use libp2p_core::{UpgradeInfo, InboundUpgrade, OutboundUpgrade};
-use lazy_static::lazy_static;
-use snow;
+use libp2p_core::{identity, UpgradeInfo, InboundUpgrade, OutboundUpgrade, upgrade::Negotiated};
 use tokio_io::{AsyncRead, AsyncWrite};
-use util::Resolver;
-
-lazy_static! {
-    static ref PARAMS_IK: snow::params::NoiseParams = "Noise_IK_25519_ChaChaPoly_SHA256"
-        .parse()
-        .expect("valid pattern");
-
-    static ref PARAMS_IX: snow::params::NoiseParams = "Noise_IX_25519_ChaChaPoly_SHA256"
-        .parse()
-        .expect("valid pattern");
-
-    static ref PARAMS_XX: snow::params::NoiseParams = "Noise_XX_25519_ChaChaPoly_SHA256"
-        .parse()
-        .expect("valid pattern");
-}
-
-#[derive(Debug, Clone)]
-pub enum IK {}
-
-#[derive(Debug, Clone)]
-pub enum IX {}
-
-#[derive(Debug, Clone)]
-pub enum XX {}
+use zeroize::Zeroize;
 
 /// The protocol upgrade configuration.
 #[derive(Clone)]
-pub struct NoiseConfig<P, R = ()> {
-    keypair: Keypair<Curve25519>,
-    params: snow::params::NoiseParams,
+pub struct NoiseConfig<P, C: Zeroize, R = ()> {
+    dh_keys: AuthenticKeypair<C>,
+    params: ProtocolParams,
     remote: R,
     _marker: std::marker::PhantomData<P>
 }
 
-impl NoiseConfig<IX> {
-    /// Create a new `NoiseConfig` for the IX handshake pattern.
-    pub fn ix(kp: Keypair<Curve25519>) -> Self {
+impl<C> NoiseConfig<IX, C>
+where
+    C: Protocol<C> + Zeroize
+{
+    /// Create a new `NoiseConfig` for the `IX` handshake pattern.
+    pub fn ix(dh_keys: AuthenticKeypair<C>) -> Self {
         NoiseConfig {
-            keypair: kp,
-            params: PARAMS_IX.clone(),
+            dh_keys,
+            params: C::params_ix(),
             remote: (),
             _marker: std::marker::PhantomData
         }
     }
 }
 
-impl NoiseConfig<XX> {
-    /// Create a new `NoiseConfig` for the XX handshake pattern.
-    pub fn xx(kp: Keypair<Curve25519>) -> Self {
+impl<C> NoiseConfig<XX, C>
+where
+    C: Protocol<C> + Zeroize
+{
+    /// Create a new `NoiseConfig` for the `XX` handshake pattern.
+    pub fn xx(dh_keys: AuthenticKeypair<C>) -> Self {
         NoiseConfig {
-            keypair: kp,
-            params: PARAMS_XX.clone(),
+            dh_keys,
+            params: C::params_xx(),
             remote: (),
             _marker: std::marker::PhantomData
         }
     }
 }
 
-impl NoiseConfig<IK> {
-    /// Create a new `NoiseConfig` for the IK handshake pattern (recipient side).
-    pub fn ik_listener(kp: Keypair<Curve25519>) -> Self {
+impl<C> NoiseConfig<IK, C>
+where
+    C: Protocol<C> + Zeroize
+{
+    /// Create a new `NoiseConfig` for the `IK` handshake pattern (recipient side).
+    ///
+    /// Since the identity of the local node is known to the remote, this configuration
+    /// does not transmit a static DH public key or public identity key to the remote.
+    pub fn ik_listener(dh_keys: AuthenticKeypair<C>) -> Self {
         NoiseConfig {
-            keypair: kp,
-            params: PARAMS_IK.clone(),
+            dh_keys,
+            params: C::params_ik(),
             remote: (),
             _marker: std::marker::PhantomData
         }
     }
 }
 
-impl NoiseConfig<IK, PublicKey<Curve25519>> {
-    /// Create a new `NoiseConfig` for the IK handshake pattern (initiator side).
-    pub fn ik_dialer(kp: Keypair<Curve25519>, remote: PublicKey<Curve25519>) -> Self {
+impl<C> NoiseConfig<IK, C, (PublicKey<C>, identity::PublicKey)>
+where
+    C: Protocol<C> + Zeroize
+{
+    /// Create a new `NoiseConfig` for the `IK` handshake pattern (initiator side).
+    ///
+    /// In this configuration, the remote identity is known to the local node,
+    /// but the local node still needs to transmit its own public identity.
+    pub fn ik_dialer(
+        dh_keys: AuthenticKeypair<C>,
+        remote_id: identity::PublicKey,
+        remote_dh: PublicKey<C>
+    ) -> Self {
         NoiseConfig {
-            keypair: kp,
-            params: PARAMS_IK.clone(),
-            remote,
+            dh_keys,
+            params: C::params_ik(),
+            remote: (remote_dh, remote_id),
             _marker: std::marker::PhantomData
         }
     }
@@ -145,146 +146,134 @@ impl NoiseConfig<IK, PublicKey<Curve25519>> {
 
 // Handshake pattern IX /////////////////////////////////////////////////////
 
-impl UpgradeInfo for NoiseConfig<IX> {
-    type Info = &'static [u8];
-    type InfoIter = std::iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(b"/noise/ix/25519/chachapoly/sha256/0.1.0")
-    }
-}
-
-impl<T> InboundUpgrade<T> for NoiseConfig<IX>
+impl<T, C> InboundUpgrade<T> for NoiseConfig<IX, C>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<IX, C>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt1::NoiseInboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_inbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
+    fn upgrade_inbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
             .build_responder()
             .map_err(NoiseError::from);
-        rt1::NoiseInboundFuture::new(socket, session)
+        Handshake::rt1_responder(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Mutual)
     }
 }
 
-impl<T> OutboundUpgrade<T> for NoiseConfig<IX>
+impl<T, C> OutboundUpgrade<T> for NoiseConfig<IX, C>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<IX, C>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt1::NoiseOutboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_outbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
+    fn upgrade_outbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
             .build_initiator()
             .map_err(NoiseError::from);
-        rt1::NoiseOutboundFuture::new(socket, session)
+        Handshake::rt1_initiator(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Mutual)
     }
 }
 
 // Handshake pattern XX /////////////////////////////////////////////////////
 
-impl UpgradeInfo for NoiseConfig<XX> {
-    type Info = &'static [u8];
-    type InfoIter = std::iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(b"/noise/xx/25519/chachapoly/sha256/0.1.0")
-    }
-}
-
-impl<T> InboundUpgrade<T> for NoiseConfig<XX>
+impl<T, C> InboundUpgrade<T> for NoiseConfig<XX, C>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<XX, C>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt15::NoiseInboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_inbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
+    fn upgrade_inbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
             .build_responder()
             .map_err(NoiseError::from);
-        rt15::NoiseInboundFuture::new(socket, session)
+        Handshake::rt15_responder(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Mutual)
     }
 }
 
-impl<T> OutboundUpgrade<T> for NoiseConfig<XX>
+impl<T, C> OutboundUpgrade<T> for NoiseConfig<XX, C>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<XX, C>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt15::NoiseOutboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_outbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
+    fn upgrade_outbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
             .build_initiator()
             .map_err(NoiseError::from);
-        rt15::NoiseOutboundFuture::new(socket, session)
+        Handshake::rt15_initiator(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Mutual)
     }
 }
 
 // Handshake pattern IK /////////////////////////////////////////////////////
 
-impl UpgradeInfo for NoiseConfig<IK> {
-    type Info = &'static [u8];
-    type InfoIter = std::iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(b"/noise/ik/25519/chachapoly/sha256/0.1.0")
-    }
-}
-
-impl UpgradeInfo for NoiseConfig<IK, PublicKey<Curve25519>> {
-    type Info = &'static [u8];
-    type InfoIter = std::iter::Once<Self::Info>;
-
-    fn protocol_info(&self) -> Self::InfoIter {
-        std::iter::once(b"/noise/ik/25519/chachapoly/sha256/0.1.0")
-    }
-}
-
-impl<T> InboundUpgrade<T> for NoiseConfig<IK>
+impl<T, C> InboundUpgrade<T> for NoiseConfig<IK, C>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<IK, C>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt1::NoiseInboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_inbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
+    fn upgrade_inbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
             .build_responder()
             .map_err(NoiseError::from);
-        rt1::NoiseInboundFuture::new(socket, session)
+        Handshake::rt1_responder(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Receive)
     }
 }
 
-impl<T> OutboundUpgrade<T> for NoiseConfig<IK, PublicKey<Curve25519>>
+impl<T, C> OutboundUpgrade<T> for NoiseConfig<IK, C, (PublicKey<C>, identity::PublicKey)>
 where
-    T: AsyncRead + AsyncWrite
+    NoiseConfig<IK, C, (PublicKey<C>, identity::PublicKey)>: UpgradeInfo,
+    T: AsyncRead + AsyncWrite + Send + 'static,
+    C: Protocol<C> + AsRef<[u8]> + Zeroize + Send + 'static,
 {
-    type Output = (PublicKey<Curve25519>, NoiseOutput<T>);
+    type Output = (RemoteIdentity<C>, NoiseOutput<Negotiated<T>>);
     type Error = NoiseError;
-    type Future = rt1::NoiseOutboundFuture<T>;
+    type Future = Handshake<Negotiated<T>, C>;
 
-    fn upgrade_outbound(self, socket: T, _: Self::Info) -> Self::Future {
-        let session = snow::Builder::with_resolver(self.params, Box::new(Resolver))
-            .local_private_key(self.keypair.secret().as_ref())
-            .remote_public_key(self.remote.as_ref())
+    fn upgrade_outbound(self, socket: Negotiated<T>, _: Self::Info) -> Self::Future {
+        let session = self.params.into_builder()
+            .local_private_key(self.dh_keys.secret().as_ref())
+            .remote_public_key(self.remote.0.as_ref())
             .build_initiator()
             .map_err(NoiseError::from);
-        rt1::NoiseOutboundFuture::new(socket, session)
+        Handshake::rt1_initiator(socket, session,
+            self.dh_keys.into_identity(),
+            IdentityExchange::Send { remote: self.remote.1 })
     }
 }
 

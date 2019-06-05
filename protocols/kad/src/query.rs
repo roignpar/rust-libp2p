@@ -23,14 +23,11 @@
 //! This allows one to create queries that iterate on the DHT on nodes that become closer and
 //! closer to the target.
 
-use crate::handler::KademliaHandlerIn;
-use crate::kbucket::KBucketsPeerId;
+use crate::kbucket;
 use futures::prelude::*;
-use libp2p_core::PeerId;
-use multihash::Multihash;
 use smallvec::SmallVec;
-use std::time::{Duration, Instant};
-use tokio_timer::Delay;
+use std::{cmp::PartialEq, time::Duration};
+use wasm_timer::{Delay, Instant};
 
 /// State of a query iterative process.
 ///
@@ -43,9 +40,12 @@ use tokio_timer::Delay;
 /// `GET_PROVIDERS`, you need to extract yourself the value or list of providers from RPC requests
 /// received by remotes as this is not handled by the `QueryState`.
 #[derive(Debug)]
-pub struct QueryState {
+pub struct QueryState<TTarget, TPeerId> {
     /// Target we're looking for.
-    target: QueryTarget,
+    target: TTarget,
+
+    /// The `kbucket::Key` representation of the `target`.
+    target_key: kbucket::Key<TTarget>,
 
     /// Stage of the query. See the documentation of `QueryStage`.
     stage: QueryStage,
@@ -53,7 +53,7 @@ pub struct QueryState {
     /// Ordered list of the peers closest to the result we're looking for.
     /// Entries that are `InProgress` shouldn't be removed from the list before they complete.
     /// Must never contain two entries with the same peer IDs.
-    closest_peers: SmallVec<[(PeerId, QueryPeerState); 32]>,
+    closest_peers: SmallVec<[(kbucket::Key<TPeerId>, QueryPeerState); 32]>,
 
     /// Allowed level of parallelism.
     parallelism: usize,
@@ -67,9 +67,9 @@ pub struct QueryState {
 
 /// Configuration for a query.
 #[derive(Debug, Clone)]
-pub struct QueryConfig<TIter> {
+pub struct QueryConfig<TIter, TTarget> {
     /// Target of the query.
-    pub target: QueryTarget,
+    pub target: TTarget,
 
     /// Iterator to a list of `num_results` nodes that we know of whose distance is close to the
     /// target.
@@ -101,23 +101,29 @@ enum QueryStage {
     Frozen,
 }
 
-impl QueryState {
+impl<TTarget, TPeerId> QueryState<TTarget, TPeerId>
+where
+    TTarget: Into<kbucket::Key<TTarget>> + Clone,
+    TPeerId: Into<kbucket::Key<TPeerId>> + Eq
+{
     /// Creates a new query.
     ///
     /// You should call `poll()` this function returns in order to know what to do.
-    pub fn new(config: QueryConfig<impl IntoIterator<Item = PeerId>>) -> QueryState {
+    pub fn new(config: QueryConfig<impl IntoIterator<Item = kbucket::Key<TPeerId>>, TTarget>) -> Self {
         let mut closest_peers: SmallVec<[_; 32]> = config
             .known_closest_peers
             .into_iter()
-            .map(|peer_id| (peer_id, QueryPeerState::NotContacted))
+            .map(|key| (key, QueryPeerState::NotContacted))
             .take(config.num_results)
             .collect();
-        let target = config.target;
-        closest_peers.sort_by_key(|e| target.as_hash().distance_with(e.0.as_ref()));
+
+        let target_key = config.target.clone().into();
+        closest_peers.sort_by_key(|e| target_key.distance(&e.0));
         closest_peers.dedup_by(|a, b| a.0 == b.0);
 
         QueryState {
-            target,
+            target: config.target,
+            target_key,
             stage: QueryStage::Iterating {
                 no_closer_in_a_row: 0,
             },
@@ -130,8 +136,17 @@ impl QueryState {
 
     /// Returns the target of the query. Always the same as what was passed to `new()`.
     #[inline]
-    pub fn target(&self) -> &QueryTarget {
+    pub fn target(&self) -> &TTarget {
         &self.target
+    }
+
+    /// Returns the target of the query. Always the same as what was passed to `new()`.
+    ///
+    /// You shouldn't modify the target in such a way that modifies the target of the query,
+    /// otherwise logic errors will likely happen.
+    #[inline]
+    pub fn target_mut(&mut self) -> &mut TTarget {
+        &mut self.target
     }
 
     /// After `poll()` returned `SendRpc`, this method should be called when the node sends back
@@ -143,31 +158,35 @@ impl QueryState {
     /// After this function returns, you should call `poll()` again.
     pub fn inject_rpc_result(
         &mut self,
-        result_source: &PeerId,
-        closer_peers: impl IntoIterator<Item = PeerId>,
+        result_source: &impl PartialEq<TPeerId>,
+        closer_peers: impl IntoIterator<Item = TPeerId>,
     ) {
         // Mark the peer as succeeded.
         for (peer_id, state) in self.closest_peers.iter_mut() {
-            if peer_id == result_source {
+            if result_source == peer_id.preimage() {
                 if let state @ QueryPeerState::InProgress(_) = state {
                     *state = QueryPeerState::Succeeded;
                 }
             }
         }
 
+        let num_closest = self.closest_peers.len();
+
         // Add the entries in `closest_peers`.
         if let QueryStage::Iterating {
             ref mut no_closer_in_a_row,
         } = self.stage
         {
+            let target = &self.target_key;
+
             // We increment now, and reset to 0 if we find a closer node.
             *no_closer_in_a_row += 1;
 
-            for elem_to_add in closer_peers {
-                let target = &self.target;
-                let elem_to_add_distance = target.as_hash().distance_with(elem_to_add.as_ref());
-                let insert_pos_start = self.closest_peers.iter().position(|(id, _)| {
-                    target.as_hash().distance_with(id.as_ref()) >= elem_to_add_distance
+            for peer in closer_peers {
+                let peer_key = peer.into();
+                let peer_distance = target.distance(&peer_key);
+                let insert_pos_start = self.closest_peers.iter().position(|(key, _)| {
+                    target.distance(&key) >= peer_distance
                 });
 
                 if let Some(insert_pos_start) = insert_pos_start {
@@ -175,29 +194,29 @@ impl QueryState {
                     // `insert_pos_start + insert_pos_size`.
                     let insert_pos_size = self.closest_peers.iter()
                         .skip(insert_pos_start)
-                        .position(|(id, _)| {
-                            target.as_hash().distance_with(id.as_ref()) > elem_to_add_distance
+                        .position(|(key, _)| {
+                            target.distance(&key) > peer_distance
                         });
 
                     // Make sure we don't insert duplicates.
+                    let mut iter_start = self.closest_peers.iter().skip(insert_pos_start);
                     let duplicate = if let Some(insert_pos_size) = insert_pos_size {
-                        self.closest_peers.iter().skip(insert_pos_start).take(insert_pos_size).any(|e| e.0 == elem_to_add)
+                        iter_start.take(insert_pos_size).any(|e| e.0 == peer_key)
                     } else {
-                        self.closest_peers.iter().skip(insert_pos_start).any(|e| e.0 == elem_to_add)
+                        iter_start.any(|e| e.0 == peer_key)
                     };
 
                     if !duplicate {
                         if insert_pos_start == 0 {
                             *no_closer_in_a_row = 0;
                         }
-                        debug_assert!(self.closest_peers.iter().all(|e| e.0 != elem_to_add));
+                        debug_assert!(self.closest_peers.iter().all(|e| e.0 != peer_key));
                         self.closest_peers
-                            .insert(insert_pos_start, (elem_to_add, QueryPeerState::NotContacted));
+                            .insert(insert_pos_start, (peer_key, QueryPeerState::NotContacted));
                     }
-                } else if self.closest_peers.len() < self.num_results {
-                    debug_assert!(self.closest_peers.iter().all(|e| e.0 != elem_to_add));
-                    self.closest_peers
-                        .push((elem_to_add, QueryPeerState::NotContacted));
+                } else if num_closest < self.num_results {
+                    debug_assert!(self.closest_peers.iter().all(|e| e.0 != peer_key));
+                    self.closest_peers.push((peer_key, QueryPeerState::NotContacted));
                 }
             }
         }
@@ -205,42 +224,42 @@ impl QueryState {
         // Check for duplicates in `closest_peers`.
         debug_assert!(self.closest_peers.windows(2).all(|w| w[0].0 != w[1].0));
 
-        // Handle if `no_closer_in_a_row` is too high.
-        let freeze = if let QueryStage::Iterating { no_closer_in_a_row } = self.stage {
-            no_closer_in_a_row >= self.parallelism
-        } else {
-            false
-        };
-        if freeze {
-            self.stage = QueryStage::Frozen;
+        let num_closest_new = self.closest_peers.len();
+
+        // Termination condition: If at least `self.parallelism` consecutive
+        // responses yield no peer closer to the target and either no new peers
+        // were discovered or the number of discovered peers reached the desired
+        // number of results, then the query is considered complete.
+        if let QueryStage::Iterating { no_closer_in_a_row } = self.stage {
+            if no_closer_in_a_row >= self.parallelism &&
+                (num_closest == num_closest_new ||
+                     num_closest_new >= self.num_results)
+            {
+                self.stage = QueryStage::Frozen;
+            }
         }
+    }
+
+    /// Returns the list of peers for which we are waiting for an answer.
+    pub fn waiting(&self) -> impl Iterator<Item = &TPeerId> {
+        self.closest_peers
+            .iter()
+            .filter(|(_, state)| {
+                match state {
+                    QueryPeerState::InProgress(_) => true,
+                    QueryPeerState::NotContacted => false,
+                    QueryPeerState::Succeeded => false,
+                    QueryPeerState::Failed => false,
+                }
+            })
+            .map(|(key, _)| key.preimage())
     }
 
     /// Returns true if we are waiting for a query answer from that peer.
     ///
     /// After `poll()` returned `SendRpc`, this function will return `true`.
-    pub fn is_waiting(&self, id: &PeerId) -> bool {
-        let state = self
-            .closest_peers
-            .iter()
-            .filter_map(
-                |(peer_id, state)| {
-                    if peer_id == id {
-                        Some(state)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .next();
-
-        match state {
-            Some(&QueryPeerState::InProgress(_)) => true,
-            Some(&QueryPeerState::NotContacted) => false,
-            Some(&QueryPeerState::Succeeded) => false,
-            Some(&QueryPeerState::Failed) => false,
-            None => false,
-        }
+    pub fn is_waiting(&self, id: &impl PartialEq<TPeerId>) -> bool {
+        self.waiting().any(|peer_id| id == peer_id)
     }
 
     /// After `poll()` returned `SendRpc`, this function should be called if we were unable to
@@ -250,20 +269,16 @@ impl QueryState {
     /// function whenever an error happens on the network.
     ///
     /// After this function returns, you should call `poll()` again.
-    pub fn inject_rpc_error(&mut self, id: &PeerId) {
+    pub fn inject_rpc_error(&mut self, id: &TPeerId) {
         let state = self
             .closest_peers
             .iter_mut()
-            .filter_map(
-                |(peer_id, state)| {
-                    if peer_id == id {
-                        Some(state)
-                    } else {
-                        None
-                    }
-                },
-            )
-            .next();
+            .find_map(|(peer_id, state)|
+                if peer_id.preimage() == id {
+                    Some(state)
+                } else {
+                    None
+                });
 
         match state {
             Some(state @ &mut QueryPeerState::InProgress(_)) => *state = QueryPeerState::Failed,
@@ -275,15 +290,14 @@ impl QueryState {
     }
 
     /// Polls this individual query.
-    pub fn poll(&mut self) -> Async<QueryStatePollOut<'_>> {
+    pub fn poll(&mut self) -> Async<QueryStatePollOut<'_, TTarget, TPeerId>> {
         // While iterating over peers, count the number of queries currently being processed.
         // This is used to not go over the limit of parallel requests.
         // If this is still 0 at the end of the function, that means the query is finished.
         let mut active_counter = 0;
 
         // While iterating over peers, count the number of queries in a row (from closer to further
-        // away from target) that are in the succeeded in state.
-        // Contains `None` if the chain is broken.
+        // away from target) that are in the succeeded state.
         let mut succeeded_counter = Some(0);
 
         // Extract `self.num_results` to avoid borrowing errors with closures.
@@ -291,66 +305,52 @@ impl QueryState {
 
         for &mut (ref peer_id, ref mut state) in self.closest_peers.iter_mut() {
             // Start by "killing" the query if it timed out.
-            {
-                let timed_out = match state {
-                    QueryPeerState::InProgress(timeout) => match timeout.poll() {
-                        Ok(Async::Ready(_)) | Err(_) => true,
-                        Ok(Async::NotReady) => false,
-                    },
-                    _ => false,
-                };
-                if timed_out {
-                    *state = QueryPeerState::Failed;
-                    return Async::Ready(QueryStatePollOut::CancelRpc { peer_id });
-                }
-            }
-
-            // Increment the local counters.
-            match state {
-                QueryPeerState::InProgress(_) => {
-                    active_counter += 1;
-                }
-                QueryPeerState::Succeeded => {
-                    if let Some(ref mut c) = succeeded_counter {
-                        *c += 1;
+            if let QueryPeerState::InProgress(timeout) = state {
+                match timeout.poll() {
+                    Ok(Async::Ready(_)) | Err(_) => {
+                        *state = QueryPeerState::Failed;
+                        return Async::Ready(QueryStatePollOut::CancelRpc { peer_id: peer_id.preimage() });
+                    }
+                    Ok(Async::NotReady) => {
+                        succeeded_counter = None;
+                        active_counter += 1
                     }
                 }
-                _ => (),
-            };
-
-            // We have enough results; the query is done.
-            if succeeded_counter
-                .as_ref()
-                .map(|&c| c >= num_results)
-                .unwrap_or(false)
-            {
-                return Async::Ready(QueryStatePollOut::Finished);
             }
 
-            // Dial the node if it needs dialing.
-            let need_connect = match state {
-                QueryPeerState::NotContacted => match self.stage {
-                    QueryStage::Iterating { .. } => active_counter < self.parallelism,
-                    QueryStage::Frozen => match self.target {
-                        QueryTarget::FindPeer(_) => true,
-                        QueryTarget::GetProviders(_) => false,
-                    },
-                },
-                _ => false,
-            };
+            if let QueryPeerState::Succeeded = state {
+                if let Some(ref mut cnt) = succeeded_counter {
+                    *cnt += 1;
+                    // If we have enough results; the query is done.
+                    if *cnt >= num_results {
+                        return Async::Ready(QueryStatePollOut::Finished)
+                    }
+                }
+            }
 
-            if need_connect {
-                let delay = Delay::new(Instant::now() + self.rpc_timeout);
-                *state = QueryPeerState::InProgress(delay);
-                return Async::Ready(QueryStatePollOut::SendRpc {
-                    peer_id,
-                    query_target: &self.target,
-                });
+            if let QueryPeerState::NotContacted = state {
+                let connect = match self.stage {
+                    QueryStage::Frozen => true,
+                    QueryStage::Iterating {..} => active_counter < self.parallelism,
+                };
+                if connect {
+                    let delay = Delay::new(Instant::now() + self.rpc_timeout);
+                    *state = QueryPeerState::InProgress(delay);
+                    return Async::Ready(QueryStatePollOut::SendRpc {
+                        peer_id: peer_id.preimage(),
+                        query_target: &self.target,
+                    });
+                } else {
+                    // The peer is among the `num_results` closest and still
+                    // needs to be contacted, but the query is currently at
+                    // capacity w.r.t. the allowed parallelism.
+                    return Async::NotReady
+                }
             }
         }
 
-        // If we don't have any query in progress, return `Finished` as we don't have anything more
-        // we can do.
+        // If we don't have any query in progress, return `Finished` as we don't have
+        // anything more we can do.
         if active_counter > 0 {
             Async::NotReady
         } else {
@@ -358,27 +358,36 @@ impl QueryState {
         }
     }
 
-    /// Consumes the query and returns the known closest peers.
+    /// Consumes the query and returns the target and known closest peers.
     ///
     /// > **Note**: This can be called at any time, but you normally only do that once the query
     /// >           is finished.
-    pub fn into_closest_peers(self) -> impl Iterator<Item = PeerId> {
-        self.closest_peers
+    pub fn into_target_and_closest_peers(self) -> (TTarget, impl Iterator<Item = TPeerId>) {
+        let closest = self.closest_peers
             .into_iter()
             .filter_map(|(peer_id, state)| {
                 if let QueryPeerState::Succeeded = state {
-                    Some(peer_id)
+                    Some(peer_id.into_preimage())
                 } else {
                     None
                 }
             })
-            .take(self.num_results)
+            .take(self.num_results);
+        (self.target, closest)
+    }
+
+    /// Consumes the query and returns the known closest peers.
+    ///
+    /// > **Note**: This can be called at any time, but you normally only do that once the query
+    /// >           is finished.
+    pub fn into_closest_peers(self) -> impl Iterator<Item = TPeerId> {
+        self.into_target_and_closest_peers().1
     }
 }
 
 /// Outcome of polling a query.
 #[derive(Debug, Clone)]
-pub enum QueryStatePollOut<'a> {
+pub enum QueryStatePollOut<'a, TTarget, TPeerId> {
     /// The query is finished.
     ///
     /// If this is a `FindValue` query, the user is supposed to extract the record themselves from
@@ -399,9 +408,9 @@ pub enum QueryStatePollOut<'a> {
     /// `inject_rpc_error` at a later point in time.
     SendRpc {
         /// The peer to send the RPC query to.
-        peer_id: &'a PeerId,
+        peer_id: &'a TPeerId,
         /// A reminder of the query target. Same as what you obtain by calling `target()`.
-        query_target: &'a QueryTarget,
+        query_target: &'a TTarget,
     },
 
     /// We no longer need to send a query to this specific node.
@@ -409,47 +418,8 @@ pub enum QueryStatePollOut<'a> {
     /// It is guaranteed that an earlier polling returned `SendRpc` with this peer id.
     CancelRpc {
         /// The target.
-        peer_id: &'a PeerId,
+        peer_id: &'a TPeerId,
     },
-}
-
-/// What we're aiming for with our query.
-#[derive(Debug, Clone)]
-pub enum QueryTarget {
-    /// Finding a peer.
-    FindPeer(PeerId),
-    /// Find the peers that provide a certain value.
-    GetProviders(Multihash),
-}
-
-impl QueryTarget {
-    /// Creates the corresponding RPC request to send to remote.
-    #[inline]
-    pub fn to_rpc_request<TUserData>(&self, user_data: TUserData) -> KademliaHandlerIn<TUserData> {
-        self.clone().into_rpc_request(user_data)
-    }
-
-    /// Creates the corresponding RPC request to send to remote.
-    pub fn into_rpc_request<TUserData>(self, user_data: TUserData) -> KademliaHandlerIn<TUserData> {
-        match self {
-            QueryTarget::FindPeer(key) => KademliaHandlerIn::FindNodeReq {
-                key,
-                user_data,
-            },
-            QueryTarget::GetProviders(key) => KademliaHandlerIn::GetProvidersReq {
-                key,
-                user_data,
-            },
-        }
-    }
-
-    /// Returns the hash of the thing we're looking for.
-    pub fn as_hash(&self) -> &Multihash {
-        match self {
-            QueryTarget::FindPeer(peer) => peer.as_ref(),
-            QueryTarget::GetProviders(key) => key,
-        }
-    }
 }
 
 /// State of peer in the context of a query.
@@ -467,7 +437,7 @@ enum QueryPeerState {
 
 #[cfg(test)]
 mod tests {
-    use super::{QueryConfig, QueryState, QueryStatePollOut, QueryTarget};
+    use super::{kbucket, QueryConfig, QueryState, QueryStatePollOut};
     use futures::{self, try_ready, prelude::*};
     use libp2p_core::PeerId;
     use std::{iter, time::Duration, sync::Arc, sync::Mutex, thread};
@@ -476,11 +446,12 @@ mod tests {
     #[test]
     fn start_by_sending_rpc_to_known_peers() {
         let random_id = PeerId::random();
-        let target = QueryTarget::FindPeer(PeerId::random());
+        let random_key = kbucket::Key::new(random_id.clone());
+        let target = PeerId::random();
 
         let mut query = QueryState::new(QueryConfig {
             target,
-            known_closest_peers: iter::once(random_id.clone()),
+            known_closest_peers: iter::once(random_key),
             parallelism: 3,
             num_results: 100,
             rpc_timeout: Duration::from_secs(10),
@@ -499,12 +470,13 @@ mod tests {
     #[test]
     fn continue_second_result() {
         let random_id = PeerId::random();
+        let random_key = kbucket::Key::from(random_id.clone());
         let random_id2 = PeerId::random();
-        let target = QueryTarget::FindPeer(PeerId::random());
+        let target = PeerId::random();
 
         let query = Arc::new(Mutex::new(QueryState::new(QueryConfig {
             target,
-            known_closest_peers: iter::once(random_id.clone()),
+            known_closest_peers: iter::once(random_key),
             parallelism: 3,
             num_results: 100,
             rpc_timeout: Duration::from_secs(10),
@@ -544,10 +516,11 @@ mod tests {
     #[test]
     fn timeout_works() {
         let random_id = PeerId::random();
+        let random_key = kbucket::Key::from(random_id.clone());
 
         let query = Arc::new(Mutex::new(QueryState::new(QueryConfig {
-            target: QueryTarget::FindPeer(PeerId::random()),
-            known_closest_peers: iter::once(random_id.clone()),
+            target: PeerId::random(),
+            known_closest_peers: iter::once(random_key),
             parallelism: 3,
             num_results: 100,
             rpc_timeout: Duration::from_millis(100),

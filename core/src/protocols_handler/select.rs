@@ -24,12 +24,13 @@ use crate::{
     either::EitherOutput,
     protocols_handler::{
         KeepAlive,
-        Fuse,
+        SubstreamProtocol,
         IntoProtocolsHandler,
         ProtocolsHandler,
         ProtocolsHandlerEvent,
         ProtocolsHandlerUpgrErr,
     },
+    nodes::raw_swarm::ConnectedPoint,
     upgrade::{
         InboundUpgrade,
         OutboundUpgrade,
@@ -76,11 +77,15 @@ where
 {
     type Handler = ProtocolsHandlerSelect<TProto1::Handler, TProto2::Handler>;
 
-    fn into_handler(self, remote_peer_id: &PeerId) -> Self::Handler {
+    fn into_handler(self, remote_peer_id: &PeerId, connected_point: &ConnectedPoint) -> Self::Handler {
         ProtocolsHandlerSelect {
-            proto1: self.proto1.into_handler(remote_peer_id).fuse(),
-            proto2: self.proto2.into_handler(remote_peer_id).fuse(),
+            proto1: self.proto1.into_handler(remote_peer_id, connected_point),
+            proto2: self.proto2.into_handler(remote_peer_id, connected_point),
         }
+    }
+
+    fn inbound_protocol(&self) -> <Self::Handler as ProtocolsHandler>::InboundProtocol {
+        SelectUpgrade::new(self.proto1.inbound_protocol(), self.proto2.inbound_protocol())
     }
 }
 
@@ -88,9 +93,9 @@ where
 #[derive(Debug, Clone)]
 pub struct ProtocolsHandlerSelect<TProto1, TProto2> {
     /// The first protocol.
-    proto1: Fuse<TProto1>,
+    proto1: TProto1,
     /// The second protocol.
-    proto2: Fuse<TProto2>,
+    proto2: TProto2,
 }
 
 impl<TProto1, TProto2> ProtocolsHandlerSelect<TProto1, TProto2> {
@@ -98,8 +103,8 @@ impl<TProto1, TProto2> ProtocolsHandlerSelect<TProto1, TProto2> {
     #[inline]
     pub(crate) fn new(proto1: TProto1, proto2: TProto2) -> Self {
         ProtocolsHandlerSelect {
-            proto1: Fuse::new(proto1),
-            proto2: Fuse::new(proto2),
+            proto1,
+            proto2,
         }
     }
 }
@@ -119,15 +124,17 @@ where
     type OutEvent = EitherOutput<TProto1::OutEvent, TProto2::OutEvent>;
     type Error = EitherError<TProto1::Error, TProto2::Error>;
     type Substream = TSubstream;
-    type InboundProtocol = SelectUpgrade<<Fuse<TProto1> as ProtocolsHandler>::InboundProtocol, <Fuse<TProto2> as ProtocolsHandler>::InboundProtocol>;
+    type InboundProtocol = SelectUpgrade<<TProto1 as ProtocolsHandler>::InboundProtocol, <TProto2 as ProtocolsHandler>::InboundProtocol>;
     type OutboundProtocol = EitherUpgrade<TProto1::OutboundProtocol, TProto2::OutboundProtocol>;
     type OutboundOpenInfo = EitherOutput<TProto1::OutboundOpenInfo, TProto2::OutboundOpenInfo>;
 
     #[inline]
-    fn listen_protocol(&self) -> Self::InboundProtocol {
+    fn listen_protocol(&self) -> SubstreamProtocol<Self::InboundProtocol> {
         let proto1 = self.proto1.listen_protocol();
         let proto2 = self.proto2.listen_protocol();
-        SelectUpgrade::new(proto1, proto2)
+        let timeout = std::cmp::max(proto1.timeout(), proto2.timeout()).clone();
+        SubstreamProtocol::new(SelectUpgrade::new(proto1.into_upgrade(), proto2.into_upgrade()))
+            .with_timeout(timeout)
     }
 
     fn inject_fully_negotiated_outbound(&mut self, protocol: <Self::OutboundProtocol as OutboundUpgrade<TSubstream>>::Output, endpoint: Self::OutboundOpenInfo) {
@@ -161,17 +168,8 @@ where
     }
 
     #[inline]
-    fn inject_inbound_closed(&mut self) {
-        self.proto1.inject_inbound_closed();
-        self.proto2.inject_inbound_closed();
-    }
-
-    #[inline]
     fn inject_dial_upgrade_error(&mut self, info: Self::OutboundOpenInfo, error: ProtocolsHandlerUpgrErr<<Self::OutboundProtocol as OutboundUpgrade<Self::Substream>>::Error>) {
         match (info, error) {
-            (EitherOutput::First(info), ProtocolsHandlerUpgrErr::MuxerDeniedSubstream) => {
-                self.proto1.inject_dial_upgrade_error(info, ProtocolsHandlerUpgrErr::MuxerDeniedSubstream)
-            },
             (EitherOutput::First(info), ProtocolsHandlerUpgrErr::Timer) => {
                 self.proto1.inject_dial_upgrade_error(info, ProtocolsHandlerUpgrErr::Timer)
             },
@@ -186,9 +184,6 @@ where
             },
             (EitherOutput::First(_), ProtocolsHandlerUpgrErr::Upgrade(UpgradeError::Apply(EitherError::B(_)))) => {
                 panic!("Wrong API usage; the upgrade error doesn't match the outbound open info");
-            },
-            (EitherOutput::Second(info), ProtocolsHandlerUpgrErr::MuxerDeniedSubstream) => {
-                self.proto2.inject_dial_upgrade_error(info, ProtocolsHandlerUpgrErr::MuxerDeniedSubstream)
             },
             (EitherOutput::Second(info), ProtocolsHandlerUpgrErr::Timeout) => {
                 self.proto2.inject_dial_upgrade_error(info, ProtocolsHandlerUpgrErr::Timeout)
@@ -213,26 +208,20 @@ where
         cmp::max(self.proto1.connection_keep_alive(), self.proto2.connection_keep_alive())
     }
 
-    #[inline]
-    fn shutdown(&mut self) {
-        self.proto1.shutdown();
-        self.proto2.shutdown();
-    }
-
     fn poll(&mut self) -> Poll<ProtocolsHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::OutEvent>, Self::Error> {
         loop {
             match self.proto1.poll().map_err(EitherError::A)? {
                 Async::Ready(ProtocolsHandlerEvent::Custom(event)) => {
                     return Ok(Async::Ready(ProtocolsHandlerEvent::Custom(EitherOutput::First(event))));
                 },
-                Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest { upgrade, info}) => {
+                Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                    protocol,
+                    info,
+                }) => {
                     return Ok(Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                        upgrade: EitherUpgrade::A(upgrade),
+                        protocol: protocol.map_upgrade(EitherUpgrade::A),
                         info: EitherOutput::First(info),
                     }));
-                },
-                Async::Ready(ProtocolsHandlerEvent::Shutdown) => {
-                    self.proto2.shutdown();
                 },
                 Async::NotReady => ()
             };
@@ -241,17 +230,14 @@ where
                 Async::Ready(ProtocolsHandlerEvent::Custom(event)) => {
                     return Ok(Async::Ready(ProtocolsHandlerEvent::Custom(EitherOutput::Second(event))));
                 },
-                Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest { upgrade, info }) => {
+                Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
+                    protocol,
+                    info,
+                }) => {
                     return Ok(Async::Ready(ProtocolsHandlerEvent::OutboundSubstreamRequest {
-                        upgrade: EitherUpgrade::B(upgrade),
+                        protocol: protocol.map_upgrade(EitherUpgrade::B),
                         info: EitherOutput::Second(info),
                     }));
-                },
-                Async::Ready(ProtocolsHandlerEvent::Shutdown) => {
-                    if !self.proto1.is_shutdown() {
-                        self.proto1.shutdown();
-                        continue;
-                    }
                 },
                 Async::NotReady => ()
             };
@@ -259,10 +245,6 @@ where
             break;
         }
 
-        if self.proto1.is_shutdown() && self.proto2.is_shutdown() {
-            Ok(Async::Ready(ProtocolsHandlerEvent::Shutdown))
-        } else {
-            Ok(Async::NotReady)
-        }
+        Ok(Async::NotReady)
     }
 }

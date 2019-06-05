@@ -62,17 +62,20 @@ mod denied;
 mod either;
 mod error;
 mod map;
+mod optional;
 mod select;
 mod transfer;
 
 use futures::future::Future;
 
+pub use multistream_select::Negotiated;
 pub use self::{
     apply::{apply, apply_inbound, apply_outbound, InboundUpgradeApply, OutboundUpgradeApply},
     denied::DeniedUpgrade,
     either::EitherUpgrade,
     error::UpgradeError,
     map::{MapInboundUpgrade, MapOutboundUpgrade, MapInboundUpgradeErr, MapOutboundUpgradeErr},
+    optional::OptionalUpgrade,
     select::SelectUpgrade,
     transfer::{write_one, WriteOne, read_one, ReadOne, read_one_then, ReadOneThen, ReadOneError, request_response, RequestResponse, read_respond, ReadRespond},
 };
@@ -114,7 +117,7 @@ pub trait InboundUpgrade<C>: UpgradeInfo {
     /// method is called to start the handshake.
     ///
     /// The `info` is the identifier of the protocol, as produced by `protocol_info`.
-    fn upgrade_inbound(self, socket: C, info: Self::Info) -> Self::Future;
+    fn upgrade_inbound(self, socket: Negotiated<C>, info: Self::Info) -> Self::Future;
 }
 
 /// Extension trait for `InboundUpgrade`. Automatically implemented on all types that implement
@@ -154,7 +157,7 @@ pub trait OutboundUpgrade<C>: UpgradeInfo {
     /// method is called to start the handshake.
     ///
     /// The `info` is the identifier of the protocol, as produced by `protocol_info`.
-    fn upgrade_outbound(self, socket: C, info: Self::Info) -> Self::Future;
+    fn upgrade_outbound(self, socket: Negotiated<C>, info: Self::Info) -> Self::Future;
 }
 
 /// Extention trait for `OutboundUpgrade`. Automatically implemented on all types that implement

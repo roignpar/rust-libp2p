@@ -1,3 +1,109 @@
+# Version 0.9.0 (2019-06-04)
+
+- Major fixes and performance improvements to libp2p-kad.
+- Initial prototype for record storage in libp2p-kad.
+- Rewrote the implementation of WebSockets. It now properly supports WebSockets Secure (WSS).
+- Removed `BrowserWsConfig`. Please use `libp2p::wasm_ext::ExtTransport` instead.
+- Added a `Path` parameter to `multiaddr::Protocol::WS` and `WSS`. The string representation when a path is present is respectively `x-parity-ws/<path>` and `x-parity-wss/<path>` where `<path>` is percent-encoded.
+- Fixed an issue with `libp2p-tcp` where the wrong listened address was returned, if the actual address was loopback.
+- Added `core::upgrade::OptionalUpgrade`.
+- Added some utility functions in `core::identity::secp256k1`.
+- It is now possible to inject an artificial connection in the `RawSwarm`.
+
+# Version 0.8.1 (2019-05-15)
+
+- Fixed a vulnerability in ED25519 signatures verification in libp2p-core.
+
+# Version 0.8.0 (2019-05-15)
+
+- Crate now successfully runs from within the browser when compiled to WASM.
+- Modified the constructors of `NoiseConfig` to accept any type of public key. The Noise handshake has consequently been modified.
+- Changed the `StreamMuxer` trait to have an `Error` associated type.
+- The `Swarm` now ranks externally-visible multiaddresses by how often they have been reported, ensuring that weird or malicious reports don't affect connectivity too much.
+- Added `IntoProtocolsHandler::inbound_protocol`. Must return the same value as what `ProtocolsHandler::listen_protocol` would return.
+- `IntoProtocolsHandler::into_handler` now takes a second parameter with the `&ConnectedPoint` to the node we are connected to.
+- Replaced the `secp256k1` crate with `libsecp256k1`.
+- Fixed `Kademlia::add_providing` taking a `PeerId` instead of a `Multihash`.
+- Fixed various bugs in the implementation of `Kademlia`.
+- Added `OneSubstreamMuxer`.
+- Added the `libp2p-wasm-ext` crate.
+- Added `multiaddr::from_url`.
+- Added `OptionalTransport`.
+
+# Version 0.7.1 (2019-05-15)
+
+- Fixed a vulnerability in ED25519 signatures verification in libp2p-core.
+
+# Version 0.7.0 (2019-04-23)
+
+- Fixed the inactive connections shutdown mechanism not working.
+- `Transport::listen_on` must now return a `Stream` that produces `ListenEvent`s. This makes it possible to notify about listened addresses at a later point in time.
+- `Transport::listen_on` no longer returns an address we're listening on. This is done through `ListenEvent`s. All other `listen_on` methods have been updated accordingly.
+- Added `NetworkBehaviour::inject_new_listen_addr`, `NetworkBehaviour::inject_expired_listen_addr` and `NetworkBehaviour::inject_new_external_addr`.
+- `ProtocolsHandler::listen_protocol` and `ProtocolsHandlerEvent::OutboundSubstreamRequest` must now return a `SubstreamProtocol` struct containing a timeout for the upgrade.
+- `Ping::new` now requires a `PingConfig`, which can be created with `PingConfig::new`.
+- Removed `Transport::nat_traversal` in favour of a stand-alone `address_translation` function in `libp2p-core`.
+- Reworked the API of `Multiaddr`.
+- Removed the `ToMultiaddr` trait in favour of `TryFrom`.
+- Added `Swarm::ban_peer_id` and `Swarm::unban_peer_id`.
+- The `TPeerId` generic parameter of `RawSwarm` is now `TConnInfo` and must now implement a `ConnectionInfo` trait.
+- Reworked the `PingEvent`.
+- Renamed `KeepAlive::Forever` to `Yes` and `KeepAlive::Now` to `No`.
+
+# Version 0.6.0 (2019-03-29)
+
+- Replaced `NetworkBehaviour::inject_dial_failure` with `inject_dial_failure` and
+  `inject_addr_reach_failure`. The former is called when we have finished trying to dial a node
+  without success, while the latter is called when we have failed to reach a specific address.
+- Fixed Kademlia storing a different hash than the reference implementation.
+- Lots of bugfixes in Kademlia.
+- Modified the `InboundUpgrade` and `OutboundUpgrade` trait to take a `Negotiated<TSocket>` instead
+  of `TSocket`.
+- `PollParameters::external_addresses` now returns `Multiaddr`es as reference instead of by value.
+- Added `Swarm::external_addresses`.
+- Added a `core::swarm::toggle::Toggle` that allows having a disabled `NetworkBehaviour`.
+
+# Version 0.5.0 (2019-03-13)
+
+- Moved the `SecioKeypair` struct in `core/identity` and renamed it to `Keypair`.
+- mplex now supports half-closed substreams.
+- Renamed `StreamMuxer::shutdown()` to `close()`.
+- Closing a muxer with the `close()` method (formerly `shutdown`) now "destroys" all the existing substreams. After `close()` as been called, they all return either EOF or an error.
+- The `shutdown_substream()` method now closes only the writing side of the substream, and you can continue reading from it until EOF or until you delete it. This was actually already more or less the case before, but it wasn't properly reflected in the API or the documentation.
+- `poll_inbound()` and `poll_outbound()` no longer return an `Option`, as `None` was the same as returning an error.
+- Removed the `NodeClosed` events and renamed `NodeError` to `NodeClosed`. From the API's point of view, a connection now always closes with an error.
+- Added the `NodeHandlerWrapperError` enum that describes an error generated by the protocols handlers grouped together. It is either `UselessTimeout` or `Handler`. This allows properly reporting closing a connection because it is useless.
+- Removed `NodeHandler::inject_inbound_closed`, `NodeHandler::inject_outbound_closed`, `NodeHandler::shutdown`, and `ProtocolsHandler::shutdown`. The handler is now dropped when a shutdown process starts. This should greatly simplify writing a handler.
+- `StreamMuxer::close` now implies `flush_all`.
+- Removed the `Shutdown` enum from `stream_muxer`.
+- Removed `ProtocolsHandler::fuse()`.
+- Reworked some API of `core/nodes/node.rs` and `core/nodes/handled_node.rs`.
+- The core now works even outside of a tokio context.
+
+# Version 0.4.2 (2019-02-27)
+
+- Fixed periodic pinging not working.
+
+# Version 0.4.1 (2019-02-20)
+
+- Fixed wrong version of libp2p-noise.
+
+# Version 0.4.0 (2019-02-20)
+
+- The `multiaddr!` macro has been moved to the `multiaddr` crate and is now reexported under the name `build_multiaddr!`.
+- Modified the functions in `upgrade::transfer` to be more convenient to use.
+- Now properly sending external addresses in the identify protocol.
+- Fixed duplicate addresses being reported in identify and Kademlia.
+- Fixed infinite looping in the functions in `upgrade::transfer`.
+- Fixed infinite loop on graceful node shutdown with the `ProtocolsHandlerSelect`.
+- Fixed various issues with nodes dialing each other simultaneously.
+- Added the `StreamMuxer::is_remote_acknowledged()` method.
+- Added a `BandwidthLogging` transport wrapper that logs the bandwidth consumption.
+- The addresses to try dialing when dialing a node is now refreshed by the `Swarm` when necessary.
+- Lots of modifications to the semi-private structs in `core/nodes`.
+- Added `IdentifyEvent::SendBack`, when we send back our information.
+- Rewrote the `MemoryTransport` to be similar to the `TcpConfig`.
+
 # Version 0.3.1 (2019-02-02)
 
 - Added `NetworkBehaviour::inject_replaced` that is called whenever we replace a connection with a different connection to the same peer.
